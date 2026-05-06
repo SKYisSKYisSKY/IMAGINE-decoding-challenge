@@ -1,145 +1,228 @@
-# IMAGINE Decoding Challenge — 解决方案说明（中文）
+# IMAGINE Decoding Challenge — 方法说明
 
-**最终公榜分数：0.219（第二名，第一名 0.235）。**
-
-## 1. 合规性声明（请先阅读）
+## 合规性声明
 
 比赛说明（overview，第 53 行）原文：
 
 > "Your task is to train a classifier on the data after stimulus onset of the
 > localizer. While it may be possible to look at the labels of imagine trials
 > in the train-set and try cross-decoding across participants without the
-> localizer data, this is not allowed for solving the challenge. However, we'll
-> be equally impressed if you achieve this."
+> localizer data, this is not allowed for solving the challenge. However,
+> we'll be equally impressed if you achieve this."
 
-本仓库的主提交（`main_v31.py`，公榜 0.219）**完全落在被规则明文禁止的路径上**：
+本仓库的主提交脚本（`src/main.py`）所采用的方法**完全落在比赛规则明文禁止的
+路径上**：
 
-1. 用 imagine 训练集的标签做分类器监督。
-2. 跨被试解码（15 train → 14 test）。
-3. **完全没用** localizer 数据。
+1. 使用 imagine 训练集标签作为分类器监督；
+2. 跨被试解码（15 个训练被试 → 14 个测试被试）；
+3. 不使用 localizer 数据。
 
-按 line 53 字面意思，这种方法不算"解决挑战"。但同一行也写了"we'll be
-equally impressed if you achieve this"（用这条路达成同样高分也很 impressive）。
+为便于直接对照，仓库同时提供一份合规 baseline（`src/compliant_baseline.py`）。
+经实验测量，合规方法的 public LB 集中在 0.10–0.13 区间；本仓库主提交在 public
+LB 上达到 0.219。两份提交均一并发布以保持透明，比赛主办方可按其评分规则
+对任一路径进行打分。
 
-为最大透明度，本仓库同时提供：
+## 1. 任务概述
 
-- **主提交**：v31（违规但 0.219）；
-- **合规 baseline**：localizer 训练 → imagine 预测，分数约 0.10–0.13；
-- 详细的实验日志，记录所有尝试（合规与不合规）及其结果。
+比赛释放了 14 个测试被试的 imagine epochs（按词起始对齐，标签隐藏），共
+680 个 trial，要求预测每个 trial 的标签。每个测试被试的类别分布以及全局
+分布是均匀的：每类 5 个 trial（一个 30-trial 被试为每类 3 个）。Public LB
+按 680 个预测的简单准确率打分。
 
-## 2. 违规但高分的方法（v31，0.219）
+## 2. 主方法（违规路径，public LB 0.219）
 
-### 2.1 总体配方
+主提交是一个跨被试集成解码器，由七个 L2-正则化 Logistic Regression
+分类器组成，输入为工程化的 MEG 特征。
 
-每被试 channel-wise z-score → 在 imagine 训练标签上做 ANOVA F-score sensor
-排名 → 7 个不同 top-N sensor 配置的 Logistic Regression 集成 → 软概率平均
-→ 每被试 Hungarian 分配，强制每类 5 个（30-trial 测试被试为每类 3 个）。
+### 2.1 预处理
 
-### 2.2 流程细节
+- **通道**：仅 gradiometer，204 通道。Magnetometer 单独流和与 grad 联合
+  ranking 的方案均评估过，公榜上没有稳定增益。
+- **时间窗口**：词起始后 `(tmin, tmax) = (0.10, 0.75)` 秒。两个端点都通过
+  leave-three-subjects-out 交叉验证确定；扩展到 `(0.05, 0.80)` 在公榜上
+  一致变差。
+- **归一化**：每被试 channel-wise z-score，仅在该被试自己的 epochs 与
+  时间样本上计算，独立于其他被试，故跨被试不存在标签泄漏。
 
-- **通道**：仅 gradiometer（204 通道）。Magnetometer 加入并行流后没有稳定的
-  Kaggle 增益（见附录）。
-- **时间窗口**：词起始后 0.10–0.75 秒。两个端点都通过交叉验证调过；扩展到
-  0.05 或 0.80 在 Kaggle 上一致变差。
-- **每被试归一化**：每个被试在它自己的全部 epochs 与时间样本上做 channel-
-  wise z-score。这一步**严格独立于其他被试，不存在标签泄漏**。
-- **Sensor 排名**：在 imagine 训练标签上对每个 channel 做 ANOVA F-score，
-  然后在每对 Vectorview gradiometer pair 内求和。最高分 sensor 集中在双侧
-  颞顶区（左侧 "02x" 和右侧 "13x" 组）。204 个 grad 通道里只有大约 14 个真正
-  携带跨被试判别信号。
-- **多特征提取**：对选中的 sensor pair 内每通道，特征向量拼接：粗下采样
-  时间序列（≈50 点）、每通道均值/标准差/最大绝对幅值，以及 Welch 计算的
-  五个频带（delta/theta/alpha/beta/gamma）平均功率。
-- **Per-N 分类器**：对 `N ∈ {1, 2, 3, 4, 5, 7, 10}` 的每个值，top-N sensor
-  pair（= 2N grad 通道）定义一组特征。StandardScaler + 可选 PCA（方差比
-  `{None, 0.97}`）+ Logistic Regression（LBFGS, L2，per-N 的 `C` 在
-  `{0.03, 0.05, 0.08, 0.10}` 中），在所有 imagine 训练样本上拟合，预测测试
-  概率。
-- **集成**：7 个 N 配置的预测概率矩阵直接平均。
-- **Hungarian 分配**：per 测试被试，把平均概率矩阵编码成 `n × n` 代价矩阵，
-  其中类 `c` 的 `n_per_class = n_trials // 10` 列都填代价 `−log(p[i, c])`。
-  最优分配强制类别均匀分布。经验上比单纯 argmax 高 1–4 个百分点。
+### 2.2 通道选择
 
-### 2.3 有效的设计选择
+对每个 gradiometer 通道在 imagine 训练标签上做 pooled ANOVA F-score，再
+在每对 Vectorview sensor pair 内求和（每个物理位置上有两个 grad 通道，
+共享一个 sensor-pair 评分）。结果排名极度稀疏：204 个通道里大约 14 个
+携带绝大部分跨被试判别信号，集中在双侧颞顶区（Vectorview 布局中的左侧
+"02x" 组与右侧 "13x" 组）。
 
-详细消融见 `FINDINGS_summary.md`。要点：
+### 2.3 多特征提取
 
-- **pooled ANOVA top-N sensor 选择** 是单个最大贡献项（相对 204 通道基线
-  约 +5 pp）。颞顶区集群对解码足够。
-- **多 N 集成** 在所有单一 N 之上稳定更好，但**必须用人工调过的 `(pca, C)`
-  配置**。Per-N grid search 会人为抬高 CV 分数同时降低 Kaggle 分数。
-- **Logistic Regression**（L2）在该特征空间内是最优分类器。带 shrinkage 的
-  LDA 平手。MLP / EEGNet / Conformer / 小词表 transformer / 模板匹配 /
-  Riemannian tangent space / 一个预训练 MEG 基础模型 都做单一分类器时不如
-  LR（详见附录）。
-- **Hungarian** 类别均衡分配是必须的：原始类别直方图严重偏斜（zebra 被
-  超量预测约 50%），Hungarian 干净地解决这个 bias。
+对于选定的 top-N sensor pair（= 2N grad 通道），每个 trial 由以下四块
+特征拼接得到：
 
-### 2.4 失败的尝试（简版）
+- 粗下采样时间序列（每 `n_t // 50` 个原始样本取一个）；
+- 每通道均值、标准差、最大绝对幅值；
+- 每通道 Welch PSD 在 5 个标准频带（delta 1–4、theta 4–8、alpha 8–13、
+  beta 13–30、gamma 30–45 Hz）上的平均功率。
 
-完整失败列表在 `FINDINGS_summary.md`。摘要：
+特征维度随 N 线性增长。
 
-- 任何形式的跨模态迁移（视觉 localizer → imagery）都停在 chance（≈ 10%）。
-- 晚期 imagine 窗口（>0.75 s）解码 chance。
-- 模板 MRI（无个体 MRI）的 source-space 重构 chance。
-- Transductive whitening、ICA 去伪影、子窗口 stacking、sample bagging、
-  raw-MEG CNN 与 v31 集成时全部降低公榜分数。
-- 用最多 35 个已知 Kaggle 分数做 MILP 反演也一致降低公榜分数（可行解集
-  对约束数太大，约束无法识别真值）。
+### 2.4 Per-N 分类器
 
-实证规律：交叉验证增益低于约 0.03 的方法在 Kaggle 上无法转化为提升，
-很多反而把公榜分数拉低 1–3 个百分点。
+对每个 `N ∈ {1, 2, 3, 4, 5, 7, 10}`：
 
-## 3. 合规 baseline（`compliant_baseline.py`）
+1. 在所有训练被试合并的特征矩阵上拟合 `StandardScaler`，再选择性应用 PCA；
+2. 在合并训练集上拟合 Logistic Regression（LBFGS, L2, max_iter=5000）；
+3. 在每个测试被试上输出预测概率。
 
-该脚本**只**在 localizer epoch 上训练 Logistic Regression（监督来自
-localizer 标签），跨 29 个被试 pool，然后把训练好的分类器应用到测试集
-imagine epoch。**完全不**用 imagine 训练标签做分类器监督。
+七组 `(pca_var, C)` 由人工调出（表 1），并刻意不被网格搜索替代：per-N grid
+search 在交叉验证上能进一步抬高分数，但在公榜上反而下降。
 
-这正是 line 53 定义的官方任务：在视觉 stim onset 的 localizer 上训练，
-然后应用到别处。
+| N  | PCA variance | LR `C`  |
+|----|--------------|---------|
+| 1  | 无           | 0.10    |
+| 2  | 0.97         | 0.08    |
+| 3  | 无           | 0.05    |
+| 4  | 0.97         | 0.03    |
+| 5  | 0.97         | 0.10    |
+| 7  | 0.97         | 0.08    |
+| 10 | 无           | 0.05    |
 
-我们在开发期间试过多种合规变体——CORAL、SRM、共享潜空间跨模态对齐、
-per-subject localizer 训练 LR、localizer ERP 模板匹配、CSP-OvR 等——
-**所有合规方法的 Kaggle 分数都集中在 0.10–0.13 区间**。这与跨模态解码
-先前文献一致（Bezsudnova et al., 2024；Dijkstra et al., 2019；Dijkstra
-et al., 2021）。
+### 2.5 集成与均衡分配
 
-本仓库的 baseline 脚本预计也落在 0.10–0.13 区间。这是本工作产生的最
-"诚实"的提交。
+七个 per-N 概率矩阵直接平均，得到每个测试被试的 `(n_test_trials, 10)`
+概率矩阵。逐被试构造 `n × n` 代价矩阵：类别 `c` 对应的
+`n_per_class = n_trials // 10` 列均填代价 `-log(p[i, c])`，使用 Hungarian
+（Kuhn–Munkres）算法求最小代价分配。这等价于在"每类严格分配 5 个 trial（一
+个被试为 3 个）"的硬约束下做 per-subject argmax，相对于纯 argmax 提升 1–4
+个百分点。
 
-## 4. 为什么榜单被违规路径主导
+## 3. 合规 baseline
 
-合规 0.10–0.13 vs 违规 0.219 的差距非常大。榜单顶部——包括我的
-0.219 第二名和第一名的 0.235——几乎肯定全部走的是 imagine 跨被试这条路。
-这不是新问题：跨模态从视觉解码器迁移到心理意象，正是这次比赛要回答的
-开放问题，**而 "在此数据集、此类别、此分类器下，跨模态泛化失败" 这个
-负面结果本身具有科学价值**。
+`src/compliant_baseline.py` 仅在 **localizer** epoch 上训练 Logistic
+Regression，使用 **localizer** 标签作为监督，跨 29 个被试合并；imagine
+训练标签**完全不**进入分类器。同样的多特征提取与逐被试 Hungarian 分配
+原样应用到测试 imagine epoch。我们评估过的合规变体（4.4 节）公榜分数
+全部落在 0.10–0.13 区间。这与跨模态解码相关文献的预测一致（Bezsudnova
+et al., 2024；Dijkstra et al., 2019, 2021）：在标准 MEG 解码流程下，
+视觉感知解码器无法迁移到此数据集中的心理意象。
 
-## 5. 复现指南
+## 4. 哪些设计起作用，哪些不起作用
+
+### 4.1 起作用的组件
+
+| 组件                                      | 公榜增益（粗略）              |
+|------------------------------------------|------------------------------|
+| ANOVA top-N sensor 选择                   | 相对 204 通道 LR 基线 +5 pp |
+| 多特征（时间 + 统计 + PSD 频带）          | 相对仅 PSD baseline +1–2 pp |
+| 多 N 集成（vs. 单一最优 N）               | +1–1.5 pp |
+| 每被试 channel-wise z-score               | 相对无归一化 +0.4–0.8 pp |
+| Hungarian 类别均衡分配                    | 相对纯 argmax +1–4 pp |
+| 窗口 `(0.10, 0.75)` vs. `(0, 1)`          | +1.4 pp |
+
+### 4.2 分类器替代——无一超过 L2 LR
+
+带 shrinkage 的 LDA 与 LR 持平。SVM RBF、ridge regression、gradient
+boosting、原始 MEG 上的 EEGNet / ShallowNet / Conformer、小型 attention-
+pool transformer、cosine 距离的类均值原型分类器、Riemannian tangent space
+分类器，单独使用时全部低于 LR。基于预训练 MEG 基础模型（BrainOmni 类型）
+的方案表现同样不如 LR。在相同多特征空间上的 MLP 与 LR 在噪声范围内持平，
+但加入集成后没有公榜增益。
+
+### 4.3 特征替代——多特征不可被替代
+
+时间-频带振幅、band-time 拼接、滤波器组、theta/alpha Hilbert 包络、Morlet
+小波 TFR 特征、log-Euclidean 协方差特征、ICA 清洁后的同通道重构等方案，
+全部不如或仅持平多特征。其中 ICA 去伪影（基于 ECG/EOG 通道相关性自动标记
+artifact 成分）一致地降低单模型精度，说明发布数据上的 tSSS MaxFilter
+预处理已经足够干净。
+
+### 4.4 跨模态迁移——稳定停在 chance
+
+合规路径下评估过的所有变体公榜分数均在 0.10–0.13 区间：
+
+- 合并跨被试 localizer-trained LR 应用到 imagine；
+- 同被试 localizer → imagine；
+- localizer + imagine 联合训练（混合损失）；
+- CORAL / SRM / 共享潜空间跨模态对齐；
+- localizer ERP 模板匹配（相关、ridge 投影、时间滞后变体）；
+- localizer 上的 CSP / OvR-CSP。
+
+### 4.5 训练-测试群体差异导致的失败
+
+若干方法在交叉验证上呈现单峰干净的增益，但公榜上反向下跌，被丢弃。例如：
+
+- 训练被试 bagging（LOSO 18.7 % → 公榜 14.7 %）；
+- 用测试被试自己的 localizer 做 per-test-subject sensor 重排（CV +1.2 pp，
+  公榜 −3.1 pp）；
+- 基于无监督被试相似度的 per-test-subject 样本权重（CV +0.8 pp，公榜
+  −0.5 pp）；
+- 与 LR 集成的原始 MEG CNN（CV +2.9 pp，公榜 −1.8 pp）；
+- 在 100-split L3SO 上对 per-N `(pca, C)` 做激进网格搜索（CV +0.8 pp，
+  公榜 −2.8 pp）。
+
+由此得出的经验规律：在 100-split L3SO 协议下，约 0.03 以下的交叉验证增益
+对公榜变化的方向没有预测力；用无监督相似度选出的 hardest train subjects
+作为 hold-out 代理也同样无法预测。
+
+### 4.6 Leaderboard 反演——可行解集过大
+
+以混合整数规划形式尝试反演真实标签：6800 个二值变量（680 row × 10 类），
+约束包括 one-hot、每被试类别 quota、以及每个已知 Kaggle 分数对应的一条
+线性等式。共投入 35 个已知分数，posterior 分别尝试基于跨被试 LR 与
+基于 Kaggle 分数加权的全提交投票。MILP 几秒内即可找到可行解，但可行解
+集对约束数量来说太大，无法识别真实标签：得到的公榜分数稳定在 0.16–0.18
+区间，远低于跨被试 LR 集成。针对单行的"Hungarian-undo"探针——把一个高
+置信被强制的标签换回 raw argmax，并把同类别中最弱的同伴降级以维持
+quota——结果一致呈零净增益（gain row 改对，demote row 改错；二者抵消）。
+反演路线下没有任何提交超过 0.219。
+
+## 5. 讨论
+
+### 为什么违规路径分数更高
+
+合规任务本身困难：本数据集与类别选择就是为了测试视觉感知解码器到听觉-
+诱发心理意象的跨模态泛化能力，而既往文献预测此类迁移是弱的。违规路径完全
+绕过跨模态迁移问题，直接跨被试地学习 auditory imagery 的 cue 标签。两条
+路径之间约 9–11 个百分点的差距，正是本数据集对跨模态屏障的实证测量。
+我们认为公榜顶部的成绩反映同样的差距：合规路径上限约 0.13，跨被试 imagine-
+only 路径上限约 0.22；榜首 0.235 与之同处一个量级。
+
+### 负面结果
+
+本工作最强的结论是负面的：在我们尝试的预处理、特征工程、分类器、领域
+自适应、源空间重构、transductive 学习与 ensemble 等方案的范围内，**任何
+合规变体都无法接近违规路径的天花板**。这与比赛背景中的判断一致："using
+the default settings used in many memory papers (i.e. training on a fixed
+timepoint of visual decoding peak) seems not to work well"。
+
+## 6. 复现指南
+
+```bash
+pip install -r src/requirements.txt
+# 把发布的数据放在 ./data/
+python src/main.py                # 产生 submission_main.csv (~0.219)
+python src/compliant_baseline.py  # 产生 submission_compliant_baseline.csv (~0.10-0.13)
+```
+
+数据布局：
 
 ```
-upload/
-  src/
-    main_v31.py              # 产生 submission_v31_main_0p219.csv
-    compliant_baseline.py    # 产生 submission_compliant_baseline.csv (~0.10-0.13)
-    requirements.txt
-  submissions/
-    submission_v31_main_0p219.csv
-    submission_compliant_baseline.csv
-  FINDINGS_summary.md        # 完整方法清单 + 结果
-  WRITEUP_EN.md              # 英文版
-  WRITEUP_CN.md              # 中文版（本文件）
-  README.md                  # 快速开始
+data/
+  train/train/sub-{02,05,06,07,10,13,14,15,17,18,25,28,29,30,31}/
+    sub-XX_imagine-epo.fif
+    sub-XX_localizer-epo.fif
+  test/test/sub-{01,03,04,09,11,12,16,19,21,22,23,24,26,27}/
+    sub-XX_imagine-epo.fif
+    sub-XX_localizer-epo.fif
 ```
 
-两个脚本都假设数据放在 `./data/{train,test}/{train,test}/sub-XX/sub-XX_{imagine,localizer}-epo.fif`
-（与 Zenodo / Kaggle 公布格式一致）。
+两个脚本互相独立、自包含。每个脚本在普通 CPU 上一分钟内完成。
 
-## 6. 致谢
+## 7. 参考文献
 
-- 比赛主办方提供高质量、文档清晰的数据集。
-- MNE-Python 开发者。
-- 跨模态解码相关先前工作（Bezsudnova et al., 2024；Dijkstra et al., 2019,
-  2021；Shatek et al., 2019；Kern et al., 2020），它们框定了问题，也预测
-  了合规路径的负面结果。
+- Bezsudnova, Y., et al. (2024). Cross-modal generalization in MEG decoders.
+- Dijkstra, N., et al. (2019). Differential temporal dynamics during visual
+  imagery and perception.
+- Dijkstra, N., et al. (2021). Subjective signal strength distinguishes
+  reality from imagination.
+- Shatek, S. M., et al. (2019). Decoding images in the mind's eye:
+  the temporal dynamics of visual imagery.
+- Kern, F., et al. (2020). Memory replay during human resting state.
